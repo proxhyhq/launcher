@@ -628,9 +628,25 @@ fn main() -> eframe::Result {
     let log = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)));
     let proxhy_updating = Arc::new(Mutex::new(false));
 
+    // load icon
+    let icon_bytes = include_bytes!("../assets/icons/Proxhy.png");
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Failed to load icon bytes")
+        .to_rgba8();
+
+    let (width, height) = image.dimensions();
+    let rgba_pixels = image.into_raw();
+
+    let icon_data = egui::IconData {
+        rgba: rgba_pixels,
+        width,
+        height,
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Proxhy")
+            .with_icon(icon_data)
             .with_inner_size([800.0, 500.0]),
         ..Default::default()
     };
