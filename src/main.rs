@@ -13,7 +13,8 @@ use std::thread;
 use std::os::windows::process::CommandExt;
 
 // Suppress the console window that Windows opens for child processes.
-const fn no_window(_cmd: &mut Command) {
+#[allow(clippy::missing_const_for_fn)]
+fn no_window(_cmd: &mut Command) {
     #[cfg(windows)]
     _cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 }
