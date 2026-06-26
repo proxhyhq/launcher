@@ -222,7 +222,7 @@ fn gui_updater() -> Result<Box<dyn ReleaseUpdate>, self_update::errors::Error> {
     self_update::backends::github::Update::configure()
         .repo_owner("proxhyhq")
         .repo_name("launcher")
-        .bin_name("launcher")
+        .bin_name("proxhy-launcher")
         .current_version(env!("CARGO_PKG_VERSION"))
         .no_confirm(true)
         .build()
