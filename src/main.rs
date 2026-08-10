@@ -21,15 +21,20 @@ fn no_window(_cmd: &mut Command) {
 
 const MAX_LOG_LINES: usize = 1000;
 
-// Release asset name per platform
+// launcher is only built for arm mac, x86 linux, and x86 windows
+// name of the release asset (a compressed archive) on GitHub
 #[cfg(target_os = "macos")]
-const PROXHY_BIN_NAME: &str = "proxhy-macos";
+const PROXHY_ASSET_NAME: &str = "proxhy-aarch64-apple-darwin.tar.gz";
 #[cfg(target_os = "linux")]
-const PROXHY_BIN_NAME: &str = "proxhy-linux";
+const PROXHY_ASSET_NAME: &str = "proxhy-aarch64-unknown-linux-gnu.tar.gz";
 #[cfg(target_os = "windows")]
-const PROXHY_BIN_NAME: &str = "proxhy-windows.exe";
+const PROXHY_ASSET_NAME: &str = "proxhy-x86_64-pc-windows-msvc.zip";
 
-// --- paths ---
+// name of the binary inside the archive, and once installed locally
+#[cfg(target_os = "windows")]
+const PROXHY_BIN_NAME: &str = "proxhy.exe";
+#[cfg(not(target_os = "windows"))]
+const PROXHY_BIN_NAME: &str = "proxhy";
 
 fn proxhy_data_dir() -> PathBuf {
     let dir = dirs::data_dir()
@@ -43,7 +48,24 @@ fn proxhy_binary_path() -> PathBuf {
     proxhy_data_dir().join(PROXHY_BIN_NAME)
 }
 
-// --- log types ---
+fn proxhy_archive_path() -> PathBuf {
+    proxhy_data_dir().join(PROXHY_ASSET_NAME)
+}
+
+fn proxhy_version_path() -> PathBuf {
+    proxhy_data_dir().join("version.txt")
+}
+
+fn read_installed_proxhy_version() -> Option<String> {
+    std::fs::read_to_string(proxhy_version_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_installed_proxhy_version(version: &str) {
+    let _ = std::fs::write(proxhy_version_path(), version);
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum LogLevel {
@@ -148,15 +170,78 @@ fn fetch_latest_proxhy_version() -> Result<String, String> {
         .map(|s| s.trim_start_matches('v').to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn extract_proxhy_binary(
+    archive_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    let mut found = false;
+    for i in 0..archive.len() {
+        let mut file_in_zip = archive.by_index(i).map_err(|e| e.to_string())?;
+        if file_in_zip.name().ends_with(PROXHY_BIN_NAME) {
+            let mut output = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+            std::io::copy(&mut file_in_zip, &mut output).map_err(|e| e.to_string())?;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        return Err(format!("Binary {PROXHY_BIN_NAME} not found in archive"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_proxhy_binary(
+    archive_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+
+    let mut found = false;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let matches = {
+            let path = entry.path().map_err(|e| e.to_string())?;
+            path.file_name() == Some(std::ffi::OsStr::new(PROXHY_BIN_NAME))
+        };
+        if matches {
+            let mut output = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        return Err(format!("Binary {PROXHY_BIN_NAME} not found in archive"));
+    }
+
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 fn download_proxhy_binary(
     version: &str,
     log: &Arc<Mutex<VecDeque<LogLine>>>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
     let url = format!(
-        "https://github.com/proxhyhq/proxhy/releases/download/v{version}/{PROXHY_BIN_NAME}"
+        "https://github.com/proxhyhq/proxhy/releases/download/v{version}/{PROXHY_ASSET_NAME}"
     );
-    let dest = proxhy_binary_path();
+    let archive_dest = proxhy_archive_path();
+    let bin_dest = proxhy_binary_path();
     push_log(log, &format!("[gui] Downloading {url}..."), ctx);
 
     let client = reqwest::blocking::Client::builder()
@@ -169,7 +254,7 @@ fn download_proxhy_binary(
     }
 
     let total = resp.content_length();
-    let tmp = dest.with_extension("tmp");
+    let tmp = archive_dest.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; 65536];
     let mut downloaded: u64 = 0;
@@ -193,29 +278,43 @@ fn download_proxhy_binary(
     }
     drop(file);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())?;
-    }
-
-    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &archive_dest).map_err(|e| e.to_string())?;
     push_log(
         log,
-        &format!("[gui] Download complete ({downloaded} bytes)."),
+        &format!("[gui] Download complete ({downloaded} bytes). Extracting..."),
         ctx,
     );
+
+    extract_proxhy_binary(&archive_dest, &bin_dest)?;
+
+    std::fs::remove_file(&archive_dest).ok();
+    push_log(log, "[gui] Extraction complete.", ctx);
     Ok(())
 }
-
-// --- update state ---
 
 #[derive(Default, Clone)]
 struct UpdateState {
     gui_available: Option<String>,
     installing: bool,
     error: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct ProxhyState {
+    installed_version: Option<String>,
+    latest_version: Option<String>,
+    updating: bool,
+    error: Option<String>,
+}
+
+impl ProxhyState {
+    fn update_available(&self) -> bool {
+        match (&self.installed_version, &self.latest_version) {
+            (Some(installed), Some(latest)) => installed != latest,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 fn gui_updater() -> Result<Box<dyn ReleaseUpdate>, self_update::errors::Error> {
@@ -228,25 +327,35 @@ fn gui_updater() -> Result<Box<dyn ReleaseUpdate>, self_update::errors::Error> {
         .build()
 }
 
-// --- background startup tasks ---
-
 fn spawn_ensure_binary(
     log: Arc<Mutex<VecDeque<LogLine>>>,
-    proxhy_updating: Arc<Mutex<bool>>,
+    proxhy_state: Arc<Mutex<ProxhyState>>,
     ctx: egui::Context,
 ) {
+    proxhy_state.lock().unwrap().installed_version = read_installed_proxhy_version();
     if proxhy_binary_path().exists() {
         return;
     }
     thread::spawn(move || {
-        push_log(&log, "[gui] proxhy not found — downloading...", &ctx);
-        *proxhy_updating.lock().unwrap() = true;
+        push_log(&log, "[gui] Proxhy not found. Downloading...", &ctx);
+        proxhy_state.lock().unwrap().updating = true;
         let result = fetch_latest_proxhy_version()
-            .and_then(|version| download_proxhy_binary(&version, &log, &ctx));
-        *proxhy_updating.lock().unwrap() = false;
+            .and_then(|version| download_proxhy_binary(&version, &log, &ctx).map(|()| version));
+        let mut s = proxhy_state.lock().unwrap();
+        s.updating = false;
         match result {
-            Ok(()) => push_log(&log, "[gui] proxhy ready.", &ctx),
-            Err(e) => push_log(&log, &format!("[gui] Download failed: {e}"), &ctx),
+            Ok(version) => {
+                write_installed_proxhy_version(&version);
+                s.installed_version = Some(version.clone());
+                s.latest_version = Some(version);
+                drop(s);
+                push_log(&log, "[gui] Proxhy ready.", &ctx);
+            }
+            Err(e) => {
+                s.error = Some(e.clone());
+                drop(s);
+                push_log(&log, &format!("[gui] Download failed: {e}"), &ctx);
+            }
         }
     });
 }
@@ -265,55 +374,45 @@ fn spawn_gui_update_check(state: Arc<Mutex<UpdateState>>) {
     );
 }
 
-// --- proxhy self update ---
+fn spawn_proxhy_update_check(proxhy_state: Arc<Mutex<ProxhyState>>) {
+    thread::spawn(move || match fetch_latest_proxhy_version() {
+        Ok(version) => proxhy_state.lock().unwrap().latest_version = Some(version),
+        Err(e) => {
+            proxhy_state.lock().unwrap().error = Some(format!("proxhy update check: {e}"));
+        }
+    });
+}
 
-fn run_proxhy_self_update(
-    proxhy_updating: Arc<Mutex<bool>>,
+fn run_proxhy_update(
+    proxhy_state: Arc<Mutex<ProxhyState>>,
     log: Arc<Mutex<VecDeque<LogLine>>>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
-        *proxhy_updating.lock().unwrap() = true;
-        push_log(&log, "[gui] Running: proxhy self update...", &ctx);
-        let binary = proxhy_binary_path();
-        let mut cmd = Command::new(&binary);
-        cmd.args(["self", "update"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        no_window(&mut cmd);
-        match cmd.spawn() {
-            Ok(mut child) => {
-                if let Some(stdout) = child.stdout.take() {
-                    let log2 = Arc::clone(&log);
-                    let ctx2 = ctx.clone();
-                    thread::spawn(move || {
-                        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                            push_log(&log2, &line, &ctx2);
-                        }
-                    });
-                }
-                if let Some(stderr) = child.stderr.take() {
-                    let log2 = Arc::clone(&log);
-                    let ctx2 = ctx.clone();
-                    thread::spawn(move || {
-                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                            push_log(&log2, &line, &ctx2);
-                        }
-                    });
-                }
-                match child.wait() {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => push_log(&log, &format!("[gui] self update failed ({s})"), &ctx),
-                    Err(e) => push_log(&log, &format!("[gui] self update error: {e}"), &ctx),
-                }
+        proxhy_state.lock().unwrap().updating = true;
+        push_log(&log, "[gui] Checking for updates...", &ctx);
+
+        let result = fetch_latest_proxhy_version()
+            .and_then(|version| download_proxhy_binary(&version, &log, &ctx).map(|()| version));
+
+        let mut s = proxhy_state.lock().unwrap();
+        s.updating = false;
+        match result {
+            Ok(version) => {
+                write_installed_proxhy_version(&version);
+                s.installed_version = Some(version.clone());
+                s.latest_version = Some(version);
+                drop(s);
+                push_log(&log, "[gui] Update complete. Please restart proxhy.", &ctx);
             }
-            Err(e) => push_log(&log, &format!("[gui] Failed to run self update: {e}"), &ctx),
+            Err(e) => {
+                s.error = Some(e.clone());
+                drop(s);
+                push_log(&log, &format!("[gui] Update failed: {e}"), &ctx);
+            }
         }
-        *proxhy_updating.lock().unwrap() = false;
     });
 }
-
-// --- GUI update ---
 
 fn apply_gui_update(
     state: Arc<Mutex<UpdateState>>,
@@ -341,8 +440,6 @@ fn apply_gui_update(
     });
 }
 
-// --- log filter ---
-
 #[derive(PartialEq, Clone, Copy)]
 enum LogFilter {
     All,
@@ -351,15 +448,13 @@ enum LogFilter {
     ErrorOnly,
 }
 
-// --- app ---
-
 struct App {
     log: Arc<Mutex<VecDeque<LogLine>>>,
     child: Option<Child>,
     auto_scroll: bool,
     filter: LogFilter,
     update_state: Arc<Mutex<UpdateState>>,
-    proxhy_updating: Arc<Mutex<bool>>,
+    proxhy_state: Arc<Mutex<ProxhyState>>,
     ctx: egui::Context,
 }
 
@@ -367,7 +462,7 @@ impl App {
     fn new(
         cc: &eframe::CreationContext,
         update_state: Arc<Mutex<UpdateState>>,
-        proxhy_updating: Arc<Mutex<bool>>,
+        proxhy_state: Arc<Mutex<ProxhyState>>,
         log: Arc<Mutex<VecDeque<LogLine>>>,
     ) -> Self {
         Self {
@@ -376,7 +471,7 @@ impl App {
             auto_scroll: true,
             filter: LogFilter::All,
             update_state,
-            proxhy_updating,
+            proxhy_state,
             ctx: cc.egui_ctx.clone(),
         }
     }
@@ -466,24 +561,30 @@ impl App {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if *self.proxhy_updating.lock().unwrap() {
+        if self.proxhy_state.lock().unwrap().updating {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
     fn show_update_banner(&self, ctx: &egui::Context) {
-        let state = self.update_state.lock().unwrap().clone();
-        if state.gui_available.is_none() && state.error.is_none() {
+        let gui_state = self.update_state.lock().unwrap().clone();
+        let proxhy_state = self.proxhy_state.lock().unwrap().clone();
+        let proxhy_update_available = proxhy_state.update_available();
+        if gui_state.gui_available.is_none()
+            && gui_state.error.is_none()
+            && !proxhy_update_available
+            && proxhy_state.error.is_none()
+        {
             return;
         }
         egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if let Some(ref gv) = state.gui_available {
+                if let Some(ref gv) = gui_state.gui_available {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 200, 50),
                         format!("⬆ GUI update available: {gv}"),
                     );
-                    if state.installing {
+                    if gui_state.installing {
                         ui.spinner();
                         ui.label("Installing...");
                     } else if ui.button("Update GUI & Restart").clicked() {
@@ -494,7 +595,19 @@ impl App {
                         );
                     }
                 }
-                if let Some(ref err) = state.error {
+                if let Some(ref err) = gui_state.error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                if let (true, Some(lv)) = (
+                    proxhy_update_available,
+                    proxhy_state.latest_version.as_deref(),
+                ) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 50),
+                        format!("⬆ proxhy update available: {lv}"),
+                    );
+                }
+                if let Some(ref err) = proxhy_state.error {
                     ui.colored_label(egui::Color32::RED, err);
                 }
             });
@@ -523,16 +636,31 @@ impl App {
 
                     ui.separator();
 
-                    let updating = *self.proxhy_updating.lock().unwrap();
+                    let proxhy_state = self.proxhy_state.lock().unwrap().clone();
+                    let updating = proxhy_state.updating;
+                    if proxhy_state.update_available()
+                        && ui
+                            .add_enabled(
+                                !self.running() && !updating,
+                                egui::Button::new("⬆ Update proxhy"),
+                            )
+                            .clicked()
+                    {
+                        run_proxhy_update(
+                            Arc::clone(&self.proxhy_state),
+                            Arc::clone(&self.log),
+                            self.ctx.clone(),
+                        );
+                    }
                     if ui
                         .add_enabled(
                             !self.running() && !updating,
-                            egui::Button::new("↺ Update proxhy"),
+                            egui::Button::new("↺ Reinstall proxhy"),
                         )
                         .clicked()
                     {
-                        run_proxhy_self_update(
-                            Arc::clone(&self.proxhy_updating),
+                        run_proxhy_update(
+                            Arc::clone(&self.proxhy_state),
                             Arc::clone(&self.log),
                             self.ctx.clone(),
                         );
@@ -634,7 +762,7 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let state = Arc::new(Mutex::new(UpdateState::default()));
     let log = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES)));
-    let proxhy_updating = Arc::new(Mutex::new(false));
+    let proxhy_state = Arc::new(Mutex::new(ProxhyState::default()));
 
     let icon_data = {
         #[cfg(target_os = "macos")]
@@ -657,9 +785,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            spawn_ensure_binary(Arc::clone(&log), Arc::clone(&proxhy_updating), ctx);
+            spawn_ensure_binary(Arc::clone(&log), Arc::clone(&proxhy_state), ctx);
             spawn_gui_update_check(Arc::clone(&state));
-            Ok(Box::new(App::new(cc, state, proxhy_updating, log)))
+            spawn_proxhy_update_check(Arc::clone(&proxhy_state));
+            Ok(Box::new(App::new(cc, state, proxhy_state, log)))
         }),
     )
 }

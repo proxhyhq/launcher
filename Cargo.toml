@@ -23,9 +23,20 @@ self_update = {
 }
 serde_json = "1"
 
-[target.'cfg(windows)'.build-dependencies]
+[target.'cfg(windows)'.dependencies]
+zip = "0.6"
+
+[target.'cfg(not(windows))'.dependencies]
+tar = "0.4"
+flate2 = "1"
+
+[target."cfg(windows)".build-dependencies]
 winres = "0.1"
 
 [lints.clippy]
 nursery = "warn"
 pedantic = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
