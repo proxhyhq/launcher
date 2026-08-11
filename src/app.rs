@@ -224,6 +224,10 @@ impl App {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.heading("Proxhy");
+                    ui.colored_label(
+                        egui::Color32::GRAY,
+                        format!("v{}", env!("CARGO_PKG_VERSION")),
+                    );
                     ui.separator();
 
                     if self.running() {
