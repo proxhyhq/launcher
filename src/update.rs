@@ -231,6 +231,59 @@ fn gui_updater() -> Result<Box<dyn ReleaseUpdate>, self_update::errors::Error> {
         .build()
 }
 
+fn appimage_path() -> Option<PathBuf> {
+    std::env::var_os("APPIMAGE").map(PathBuf::from)
+}
+
+fn fetch_latest_launcher_version() -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("proxhy-launcher")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp: serde_json::Value = client
+        .get("https://api.github.com/repos/proxhyhq/launcher/releases/latest")
+        .send()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    resp["tag_name"]
+        .as_str()
+        .ok_or_else(|| "missing tag_name in API response".to_string())
+        .map(|s| s.trim_start_matches('v').to_string())
+}
+
+fn update_appimage(appimage_path: &std::path::Path) -> Result<(), String> {
+    let version = fetch_latest_launcher_version()?;
+    let url = format!(
+        "https://github.com/proxhyhq/launcher/releases/download/v{version}/Proxhy.AppImage"
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("proxhy-launcher")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut resp = client.get(&url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for {url}", resp.status()));
+    }
+
+    // download next to the target so the final rename is atomic (same filesystem)
+    let tmp = appimage_path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    std::io::copy(&mut resp, &mut file).map_err(|e| e.to_string())?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+    }
+
+    std::fs::rename(&tmp, appimage_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // --- background startup tasks ---
 
 pub fn spawn_ensure_binary(
@@ -332,17 +385,27 @@ pub fn apply_gui_update(
     thread::spawn(move || {
         state.lock().unwrap().installing = true;
         push_log(&log, "[gui] Updating proxhy-launcher...", &ctx);
-        let result = gui_updater().and_then(|u| u.update());
+
+        let result = appimage_path().map_or_else(
+            || {
+                gui_updater()
+                    .and_then(|u| u.update())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+            |path| update_appimage(&path),
+        );
+
         let mut s = state.lock().unwrap();
         s.installing = false;
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 s.gui_available = None;
                 drop(s);
                 push_log(&log, "[gui] GUI updated — please restart.", &ctx);
             }
             Err(e) => {
-                s.error = Some(e.to_string());
+                s.error = Some(e.clone());
                 drop(s);
                 push_log(&log, &format!("[gui] GUI update failed: {e}"), &ctx);
             }
