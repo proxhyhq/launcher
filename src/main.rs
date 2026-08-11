@@ -104,7 +104,7 @@ const MAX_LOG_LINES: usize = 1000;
 #[cfg(target_os = "macos")]
 const PROXHY_ASSET_NAME: &str = "proxhy-aarch64-apple-darwin.tar.gz";
 #[cfg(target_os = "linux")]
-const PROXHY_ASSET_NAME: &str = "proxhy-aarch64-unknown-linux-gnu.tar.gz";
+const PROXHY_ASSET_NAME: &str = "proxhy-x86_64-unknown-linux-gnu.tar.gz ";
 #[cfg(target_os = "windows")]
 const PROXHY_ASSET_NAME: &str = "proxhy-x86_64-pc-windows-msvc.zip";
 
