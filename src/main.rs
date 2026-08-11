@@ -19,6 +19,84 @@ fn no_window(_cmd: &mut Command) {
     _cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 }
 
+// Since the Proxhy binary is a PyInstaller onefile bundle, the process spawned
+// is a bootloader that extracts itself and runs the real interpreter as a child process
+// so we need to kill the whole tree of processes
+
+#[cfg(unix)]
+fn prepare_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // makes the spawned process its own process group leader, so we can
+    // later signal the whole group (bootloader + whatever it spawns).
+    cmd.process_group(0);
+}
+
+#[cfg(unix)]
+#[allow(clippy::cast_possible_wrap)]
+fn kill_tree(child: &Child) {
+    let pgid = child.id() as i32;
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl JobHandle {
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap(),
+            );
+            if ok == 0 {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+
+    // assigns the child (and, transitively, any processes it later spawns)
+    // to this job so the whole tree can be killed at once.
+    fn assign(&self, child: &Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle().cast()) != 0 }
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        unsafe {
+            TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 const MAX_LOG_LINES: usize = 1000;
 
 // launcher is only built for arm mac, x86 linux, and x86 windows
@@ -451,6 +529,8 @@ enum LogFilter {
 struct App {
     log: Arc<Mutex<VecDeque<LogLine>>>,
     child: Option<Child>,
+    #[cfg(windows)]
+    job: Option<JobHandle>,
     auto_scroll: bool,
     filter: LogFilter,
     update_state: Arc<Mutex<UpdateState>>,
@@ -468,6 +548,8 @@ impl App {
         Self {
             log,
             child: None,
+            #[cfg(windows)]
+            job: None,
             auto_scroll: true,
             filter: LogFilter::All,
             update_state,
@@ -485,7 +567,7 @@ impl App {
         if !binary.exists() {
             push_log(
                 &self.log,
-                "[gui] Binary not ready yet — wait for download.",
+                "[gui] Binary not ready yet; wait for download.",
                 &self.ctx,
             );
             return;
@@ -498,8 +580,24 @@ impl App {
         let mut cmd = Command::new(&binary);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         no_window(&mut cmd);
+        #[cfg(unix)]
+        prepare_process_group(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
+                #[cfg(windows)]
+                {
+                    self.job = JobHandle::new();
+                    if let Some(job) = &self.job {
+                        if !job.assign(&child) {
+                            push_log(
+                                &self.log,
+                                "[gui] Warning: failed to assign proxhy to job object; \
+                                 stopping may not kill all of its child processes.",
+                                &self.ctx,
+                            );
+                        }
+                    }
+                }
                 if let Some(stdout) = child.stdout.take() {
                     let log = Arc::clone(&self.log);
                     let ctx = self.ctx.clone();
@@ -509,7 +607,7 @@ impl App {
                         }
                     });
                 }
-                // stderr is NOT errors — proxhy's logger writes to stderr
+                // stderr is NOT errors; proxhy's logger writes to stderr
                 if let Some(stderr) = child.stderr.take() {
                     let log = Arc::clone(&self.log);
                     let ctx = self.ctx.clone();
@@ -532,11 +630,21 @@ impl App {
     }
 
     fn stop(&mut self) {
+        self.kill_child();
+        push_log(&self.log, "[gui] Stopped.", &self.ctx);
+    }
+
+    fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
+            kill_tree(&child);
+            #[cfg(windows)]
+            if let Some(job) = self.job.take() {
+                job.terminate();
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
-        push_log(&self.log, "[gui] Stopped.", &self.ctx);
     }
 
     const fn line_passes_filter(&self, line: &LogLine) -> bool {
@@ -689,10 +797,7 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.kill_child();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

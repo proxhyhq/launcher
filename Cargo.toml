@@ -28,10 +28,14 @@ flate2 = "1"
 tar = "0.4"
 
 [target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
 zip = "0.6"
 
 [target."cfg(windows)".build-dependencies]
 winres = "0.1"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
 
 [lints.clippy]
 nursery = "warn"
